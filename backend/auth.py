@@ -54,10 +54,6 @@ class Admin(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-class AdminLogin(BaseModel):
-    email: EmailStr
-    password: str
-
 class Token(BaseModel):
     access_token: str
     token_type: str
@@ -116,19 +112,51 @@ async def get_current_admin(token: str = Depends(oauth2_scheme)) -> Admin:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
+        role: str = payload.get("role")
         if email is None:
             raise credentials_exception
         token_data = TokenData(email=email)
     except JWTError:
         raise credentials_exception
     
-    # Supabaseから管理者情報を取得
-    try:
-        response = supabase.table("admins").select("*").eq("email", token_data.email).eq("is_active", True).execute()
-        admin = response.data[0] if response.data else None
-        if admin is None:
+    # JWTトークンにrole情報がない場合は、データベースから確認
+    if role != "admin":
+        # usersテーブルから管理者ロールのユーザーを検索
+        try:
+            user_response = supabase.table("users").select("*").eq("email", token_data.email).eq("role", "admin").eq("is_active", True).execute()
+            user = user_response.data[0] if user_response.data else None
+            
+            if not user:
+                raise credentials_exception
+        except Exception as e:
             raise credentials_exception
-        return Admin(**admin)
+    
+    # まずSupabaseのadminsテーブルから管理者情報を取得
+    try:
+        admin_response = supabase.table("admins").select("*").eq("email", token_data.email).eq("is_active", True).execute()
+        admin = admin_response.data[0] if admin_response.data else None
+        
+        if admin:
+            return Admin(**admin)
+        
+        # adminsテーブルにない場合、usersテーブルから管理者ロールのユーザーを検索
+        user_response = supabase.table("users").select("*").eq("email", token_data.email).eq("role", "admin").eq("is_active", True).execute()
+        user = user_response.data[0] if user_response.data else None
+        
+        if user:
+            # usersテーブルのデータをAdminモデルに変換
+            admin_data = {
+                "id": user.get("id"),
+                "email": user.get("email"),
+                "name": user.get("name", ""),
+                "role": user.get("role", "admin"),
+                "is_active": user.get("is_active", True),
+                "created_at": user.get("created_at"),
+                "updated_at": user.get("updated_at")
+            }
+            return Admin(**admin_data)
+        
+        raise credentials_exception
     except Exception as e:
         raise credentials_exception
 
@@ -175,10 +203,16 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
-        # アクセストークンの作成
+        # アクセストークンの作成（ユーザーのロールを含める）
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        token_data = {"sub": user["email"]}
+        
+        # 管理者ロールの場合は、トークンにrole情報を追加
+        if user.get("role") == "admin":
+            token_data["role"] = "admin"
+        
         access_token = create_access_token(
-            data={"sub": user["email"]}, expires_delta=access_token_expires
+            data=token_data, expires_delta=access_token_expires
         )
         
         return {"access_token": access_token, "token_type": "bearer"}
@@ -186,42 +220,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         raise HTTPException(
             status_code=401,
             detail="認証に失敗しました",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-@router.post("/admin/login", response_model=Token)
-async def admin_login(admin_data: AdminLogin):
-    try:
-        # 管理者の検証
-        response = supabase.table("admins").select("*").eq("email", admin_data.email).eq("is_active", True).execute()
-        admin = response.data[0] if response.data else None
-        
-        if not admin:
-            raise HTTPException(
-                status_code=401,
-                detail="管理者アカウントが見つかりません",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        # パスワード検証（簡易的な実装）
-        if admin_data.password != "admin123":  # 実際はハッシュ化されたパスワードを比較
-            raise HTTPException(
-                status_code=401,
-                detail="パスワードが正しくありません",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        # アクセストークンの作成
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": admin["email"], "role": "admin"}, expires_delta=access_token_expires
-        )
-        
-        return {"access_token": access_token, "token_type": "bearer"}
-    except Exception as e:
-        raise HTTPException(
-            status_code=401,
-            detail="管理者認証に失敗しました",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
